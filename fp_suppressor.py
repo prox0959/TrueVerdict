@@ -128,7 +128,7 @@ class FalsePositiveSuppressor:
                         category="FP_SUPPRESSED",
                     )
                 )
-        elif sig.signature_type == "INVALID_OR_TAMPERED" or pe.has_embedded_cert_table:
+        elif sig.signature_type == "INVALID_OR_TAMPERED":
             naive_score += 80
             independent_layers_triggered.add("L1_CRYPTO_TAMPER")
             desc = (
@@ -259,8 +259,9 @@ class FalsePositiveSuppressor:
                     EvidenceItem(
                         layer="L4_BENIGN_RSRC_ENTROPY",
                         description=(
-                            f"High file/resource entropy (Overall={pe.overall_entropy:.2f}, .rsrc={pe.resource_entropy:.2f}) "
-                            f"suppressed because executable code entropy (.text={pe.code_entropy:.2f}) is normal"
+                            f"High file/resource entropy (Overall={pe.overall_entropy:.2f}, .rsrc={pe.resource_entropy:.2f}, "
+                            f"overlay={pe.overlay_entropy:.2f}) suppressed because executable code entropy "
+                            f"(.text={pe.code_entropy:.2f}) is normal"
                         ),
                         weight=30,
                         category="FP_SUPPRESSED",
@@ -280,6 +281,19 @@ class FalsePositiveSuppressor:
                         description=(
                             f"High entropy ({pe.overall_entropy:.2f} bits/byte) suppressed for recognized "
                             f"application container: {pe.detected_container}"
+                        ),
+                        weight=30,
+                        category="FP_SUPPRESSED",
+                    )
+                )
+            elif pe.overlay_entropy >= 7.15 and pe.code_entropy < 7.10 and pe.resource_entropy < 7.15:
+                # Overlay-only high entropy (e.g., appended archive/update data) with normal code — suppress
+                suppressed.append(
+                    EvidenceItem(
+                        layer="L4_BENIGN_OVERLAY_ENTROPY",
+                        description=(
+                            f"High overlay entropy ({pe.overlay_entropy:.2f} bits/byte, {pe.overlay_size:,} bytes) "
+                            f"suppressed: executable code entropy ({pe.code_entropy:.2f}) is within normal range"
                         ),
                         weight=30,
                         category="FP_SUPPRESSED",

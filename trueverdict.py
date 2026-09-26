@@ -158,7 +158,7 @@ def scan_directory(dir_path: str, limit: int) -> List[VerdictReport]:
         pe_rep = analyzer.analyze(path)
         if not pe_rep.is_valid_pe:
             continue
-        sig_rep = verifier.verify_file(path)
+        sig_rep = verifier.verify_file(path, has_embedded_cert_table=pe_rep.has_embedded_cert_table)
         verdict = suppressor.evaluate(pe_rep, sig_rep)
         reports.append(verdict)
         print(
@@ -210,7 +210,7 @@ def main() -> int:
     suppressor = FalsePositiveSuppressor()
 
     pe_rep = analyzer.analyze(args.target)
-    sig_rep = verifier.verify_file(args.target)
+    sig_rep = verifier.verify_file(args.target, has_embedded_cert_table=pe_rep.has_embedded_cert_table)
     verdict = suppressor.evaluate(pe_rep, sig_rep)
 
     print_detailed_report(pe_rep, sig_rep, verdict)

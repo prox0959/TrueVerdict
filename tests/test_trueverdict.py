@@ -56,7 +56,7 @@ class TestTrueVerdictEngine(unittest.TestCase):
         )
         path = self._write_sample("dev_utility.exe", raw)
         pe = self.analyzer.analyze(path)
-        sig = self.verifier.verify_file(path)
+        sig = self.verifier.verify_file(path, has_embedded_cert_table=pe.has_embedded_cert_table)
         verdict = self.suppressor.evaluate(pe, sig)
 
         self.assertTrue(pe.is_valid_pe)
@@ -75,7 +75,7 @@ class TestTrueVerdictEngine(unittest.TestCase):
         )
         path = self._write_sample("repro_app.exe", raw)
         pe = self.analyzer.analyze(path)
-        sig = self.verifier.verify_file(path)
+        sig = self.verifier.verify_file(path, has_embedded_cert_table=pe.has_embedded_cert_table)
         verdict = self.suppressor.evaluate(pe, sig)
 
         self.assertTrue(pe.is_reproducible_build)
@@ -92,7 +92,7 @@ class TestTrueVerdictEngine(unittest.TestCase):
         )
         path = self._write_sample("shellcode_loader.exe", raw)
         pe = self.analyzer.analyze(path)
-        sig = self.verifier.verify_file(path)
+        sig = self.verifier.verify_file(path, has_embedded_cert_table=pe.has_embedded_cert_table)
         verdict = self.suppressor.evaluate(pe, sig)
 
         self.assertTrue(pe.has_rwx_section)
@@ -108,7 +108,7 @@ class TestTrueVerdictEngine(unittest.TestCase):
         )
         path = self._write_sample("scvhost.exe", raw)
         pe = self.analyzer.analyze(path)
-        sig = self.verifier.verify_file(path)
+        sig = self.verifier.verify_file(path, has_embedded_cert_table=pe.has_embedded_cert_table)
         verdict = self.suppressor.evaluate(pe, sig)
 
         self.assertGreaterEqual(verdict.final_risk_score, 70)
@@ -121,7 +121,7 @@ class TestTrueVerdictEngine(unittest.TestCase):
         if not os.path.isfile(cmd_path):
             self.skipTest("cmd.exe not found")
         pe = self.analyzer.analyze(cmd_path)
-        sig = self.verifier.verify_file(cmd_path)
+        sig = self.verifier.verify_file(cmd_path, has_embedded_cert_table=pe.has_embedded_cert_table)
         verdict = self.suppressor.evaluate(pe, sig)
 
         self.assertTrue(sig.is_trusted)

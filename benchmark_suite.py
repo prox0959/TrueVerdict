@@ -280,7 +280,7 @@ def run_live_benchmark() -> int:
 
         for path in legit_paths:
             pe_rep = analyzer.analyze(path)
-            sig_rep = verifier.verify_file(path)
+            sig_rep = verifier.verify_file(path, has_embedded_cert_table=pe_rep.has_embedded_cert_table)
             verdict = suppressor.evaluate(pe_rep, sig_rep)
 
             if verdict.raw_heuristic_score >= 45:
@@ -369,13 +369,13 @@ def run_live_benchmark() -> int:
             with open(t_path, "wb") as f:
                 f.write(raw_bytes)
             pe_rep = analyzer.analyze(t_path)
-            sig_rep = verifier.verify_file(t_path)
+            sig_rep = verifier.verify_file(t_path, has_embedded_cert_table=pe_rep.has_embedded_cert_table)
             verdict = suppressor.evaluate(pe_rep, sig_rep)
 
             if verdict.verdict in ("MALICIOUS", "SUSPICIOUS"):
                 tp_detected += 1
 
-            layers_str = ",".join(r.layer.replace("L", "L")[:9] for r in verdict.risk_factors[:2])
+            layers_str = ",".join(r.layer[:9] for r in verdict.risk_factors[:2])
             print(
                 f"{verdict.file_name[:28]:<28} | "
                 f"{layers_str[:28]:<28} | "

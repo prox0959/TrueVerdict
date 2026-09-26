@@ -266,12 +266,21 @@ class TrustVerifier:
         self._crypt32.CryptMsgClose.argtypes = [ctypes.c_void_p]
         self._crypt32.CryptMsgClose.restype = wintypes.BOOL
 
-    def verify_file(self, file_path: str) -> SignatureResult:
+    def verify_file(self, file_path: str, has_embedded_cert_table: bool = False) -> SignatureResult:
         """
         Runs dual-path verification:
           Step 1: Check embedded Authenticode PKCS#7 signature.
           Step 2: If no embedded signature exists, check Windows Security Catalog (.cat).
           Step 3: Extract publisher & issuer names from the certificate store.
+
+        Args:
+            file_path: Path to the PE binary.
+            has_embedded_cert_table: If True, the PE has a WIN_CERTIFICATE data directory
+                entry (detected by PEAnalyzer). When WinVerifyTrust returns
+                TRUST_E_NOSIGNATURE despite a cert table being present, the cert
+                structure is so malformed that Windows cannot parse it — a clear
+                tampering indicator. In that case we return INVALID_OR_TAMPERED instead
+                of UNSIGNED so the suppressor correctly applies the 80-point risk penalty.
         """
         if not self._available or not os.path.isfile(file_path):
             return SignatureResult(
@@ -305,6 +314,24 @@ class TrustVerifier:
 
         # 2. If embedded returns TRUST_E_NOSIGNATURE, check OS Security Catalogs
         if emb_status == TRUST_E_NOSIGNATURE:
+            # Special case: WIN_CERTIFICATE table is present but WinVerifyTrust cannot
+            # parse it — the cert blob is malformed / byte-patched. Treat as tampered.
+            if has_embedded_cert_table:
+                signer, issuer = self._extract_cert_names(abs_path)
+                return SignatureResult(
+                    is_trusted=False,
+                    signature_type="INVALID_OR_TAMPERED",
+                    status_code=emb_status,
+                    status_label=(
+                        "WIN_CERTIFICATE table present but unparseable by WinVerifyTrust "
+                        "(malformed / byte-patched Authenticode blob)"
+                    ),
+                    signer_subject=signer,
+                    issuer_subject=issuer,
+                    catalog_path="",
+                    is_microsoft_signed=False,
+                )
+
             cat_trusted, cat_path = self._verify_catalog(abs_path)
             if cat_trusted:
                 signer, issuer = self._extract_cert_names(cat_path) if cat_path else ("", "")

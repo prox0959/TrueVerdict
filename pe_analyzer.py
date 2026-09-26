@@ -641,7 +641,7 @@ class PEAnalyzer:
                     ord_num = val & 0xFFFF
                     imphash_parts.append(f"{dll_stem}.ord{ord_num}")
                 else:
-                    hint_off = self._rva_to_offset(val & 0x7FFFFFFF, report.sections)
+                    hint_off = self._rva_to_offset(val & (0x7FFFFFFFFFFFFFFF if is_64 else 0x7FFFFFFF), report.sections)
                     if hint_off is not None and hint_off + 2 < len(data):
                         f_end = data.find(b"\x00", hint_off + 2, min(len(data), hint_off + 128))
                         if f_end != -1:
