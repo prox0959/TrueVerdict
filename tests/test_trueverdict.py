@@ -114,6 +114,42 @@ class TestTrueVerdictEngine(unittest.TestCase):
         self.assertGreaterEqual(verdict.final_risk_score, 70)
         self.assertEqual(verdict.verdict, "MALICIOUS")
 
+    def test_fake_system32_subfolder_masquerade_detected(self) -> None:
+        """An unsigned svchost.exe inside a fake C:\\Temp\\...\\windows\\system32\\ folder must be caught."""
+        fake_sys32 = os.path.join(self.tmpdir.name, "windows", "system32")
+        os.makedirs(fake_sys32, exist_ok=True)
+        path = os.path.join(fake_sys32, "svchost.exe")
+        raw = SyntheticPEBuilder.build_pe64(
+            valid_rich_header=True,
+            imports=[("KERNEL32.dll", ["ExitProcess"])],
+        )
+        with open(path, "wb") as f:
+            f.write(raw)
+
+        pe = self.analyzer.analyze(path)
+        sig = self.verifier.verify_file(path, has_embedded_cert_table=pe.has_embedded_cert_table)
+        verdict = self.suppressor.evaluate(pe, sig)
+
+        self.assertGreaterEqual(verdict.final_risk_score, 70)
+        self.assertEqual(verdict.verdict, "MALICIOUS")
+
+    def test_tampered_embedded_cert_table_detected(self) -> None:
+        """A binary with a corrupted/stapled WIN_CERTIFICATE table must be flagged as MALICIOUS."""
+        raw = SyntheticPEBuilder.build_pe64(
+            valid_rich_header=True,
+            fake_cert_table=True,
+            imports=[("KERNEL32.dll", ["ExitProcess"])],
+        )
+        path = self._write_sample("tampered_signed_app.exe", raw)
+        pe = self.analyzer.analyze(path)
+        sig = self.verifier.verify_file(path, has_embedded_cert_table=pe.has_embedded_cert_table)
+        verdict = self.suppressor.evaluate(pe, sig)
+
+        self.assertTrue(pe.has_embedded_cert_table)
+        self.assertEqual(sig.signature_type, "INVALID_OR_TAMPERED")
+        self.assertGreaterEqual(verdict.final_risk_score, 70)
+        self.assertEqual(verdict.verdict, "MALICIOUS")
+
     @unittest.skipUnless(os.name == "nt", "Windows Catalog check requires Windows")
     def test_windows_system32_cmd_exe_verified_via_catalog(self) -> None:
         """Real C:\\Windows\\System32\\cmd.exe must verify as trusted via OS_CATALOG with 0 risk."""

@@ -6,21 +6,21 @@ TrueVerdict - Cryptographic Trust & Provenance Verifier (Zero Dependencies)
 Eliminates false positives on legitimate Windows and third-party binaries by
 performing dual-path cryptographic verification via native Win32 APIs:
   1. Embedded Authenticode PKCS#7 verification (wintrust.dll :: WinVerifyTrust)
-  2. OS Security Catalog (.cat) hash lookup (wintrust.dll :: CryptCATAdmin*)
-  3. X.509 Signer Subject / Issuer extraction (crypt32.dll :: CryptQueryObject)
+  2. OS Security Catalog (.cat) SHA-256 & SHA-1 lookup (wintrust.dll :: CryptCATAdmin*)
+  3. Leaf X.509 Signer Subject / Issuer extraction (crypt32.dll :: CryptQueryObject)
 
 TR: Windows sistem dosyalarinin cogu (.exe/.dll) icinde gomulu sertifika tasimaz;
 bunun yerine C:\\Windows\\System32\\CatRoot altindaki katalog (.cat) dosyalariyla
 imzalanir. Klasik araclar sadece gomulu imzaya baktigi icin temiz Windows
-dosyalarina yanlis alarm (False Positive) uretir. Bu modul her iki imzayi da
-dogrular.
+dosyalarina yanlis alarm (False Positive) uretir. Bu modul hem SHA-256 hem SHA-1
+katalog imzalarini ve gomulu imzalari dogrular.
 """
 
 import ctypes
 from ctypes import wintypes
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import List, Optional, Tuple
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +138,7 @@ class SignatureResult:
     status_code: int             # Raw WinVerifyTrust HRESULT
     status_label: str            # Human-readable status description
     signer_subject: str          # e.g. "Microsoft Windows", "Google LLC"
-    issuer_subject: str          # e.g. "Microsoft Windows Production PCA"
+    issuer_subject: str          # e.g. "Microsoft Windows Production PCA 2011"
     catalog_path: str            # Path to .cat file if catalog-signed
     is_microsoft_signed: bool    # True if verified publisher is Microsoft
 
@@ -151,6 +151,7 @@ class TrustVerifier:
 
     def __init__(self) -> None:
         self._available = os.name == "nt"
+        self._has_cat_v2 = False
         if self._available:
             self._wintrust = ctypes.WinDLL("wintrust.dll", use_last_error=True)
             self._crypt32 = ctypes.WinDLL("crypt32.dll", use_last_error=True)
@@ -158,7 +159,6 @@ class TrustVerifier:
             self._setup_prototypes()
 
     def _setup_prototypes(self) -> None:
-        # WinVerifyTrust
         self._wintrust.WinVerifyTrust.argtypes = [
             wintypes.HWND,
             ctypes.POINTER(GUID),
@@ -166,7 +166,7 @@ class TrustVerifier:
         ]
         self._wintrust.WinVerifyTrust.restype = wintypes.LONG
 
-        # Catalog APIs
+        # Legacy SHA-1 Catalog APIs
         self._wintrust.CryptCATAdminAcquireContext.argtypes = [
             ctypes.POINTER(ctypes.c_void_p),
             ctypes.POINTER(GUID),
@@ -181,6 +181,29 @@ class TrustVerifier:
             wintypes.DWORD,
         ]
         self._wintrust.CryptCATAdminCalcHashFromFileHandle.restype = wintypes.BOOL
+
+        # Modern SHA-256 Catalog APIs (Windows 8 / 10 / 11+)
+        if hasattr(self._wintrust, "CryptCATAdminAcquireContext2") and hasattr(
+            self._wintrust, "CryptCATAdminCalcHashFromFileHandle2"
+        ):
+            self._has_cat_v2 = True
+            self._wintrust.CryptCATAdminAcquireContext2.argtypes = [
+                ctypes.POINTER(ctypes.c_void_p),
+                ctypes.POINTER(GUID),
+                wintypes.LPCWSTR,
+                ctypes.c_void_p,
+                wintypes.DWORD,
+            ]
+            self._wintrust.CryptCATAdminAcquireContext2.restype = wintypes.BOOL
+
+            self._wintrust.CryptCATAdminCalcHashFromFileHandle2.argtypes = [
+                ctypes.c_void_p,
+                wintypes.HANDLE,
+                ctypes.POINTER(wintypes.DWORD),
+                ctypes.POINTER(ctypes.c_ubyte),
+                wintypes.DWORD,
+            ]
+            self._wintrust.CryptCATAdminCalcHashFromFileHandle2.restype = wintypes.BOOL
 
         self._wintrust.CryptCATAdminEnumCatalogFromHash.argtypes = [
             ctypes.c_void_p,
@@ -266,21 +289,14 @@ class TrustVerifier:
         self._crypt32.CryptMsgClose.argtypes = [ctypes.c_void_p]
         self._crypt32.CryptMsgClose.restype = wintypes.BOOL
 
-    def verify_file(self, file_path: str, has_embedded_cert_table: bool = False) -> SignatureResult:
+    def verify_file(
+        self, file_path: str, has_embedded_cert_table: bool = False
+    ) -> SignatureResult:
         """
         Runs dual-path verification:
           Step 1: Check embedded Authenticode PKCS#7 signature.
-          Step 2: If no embedded signature exists, check Windows Security Catalog (.cat).
-          Step 3: Extract publisher & issuer names from the certificate store.
-
-        Args:
-            file_path: Path to the PE binary.
-            has_embedded_cert_table: If True, the PE has a WIN_CERTIFICATE data directory
-                entry (detected by PEAnalyzer). When WinVerifyTrust returns
-                TRUST_E_NOSIGNATURE despite a cert table being present, the cert
-                structure is so malformed that Windows cannot parse it — a clear
-                tampering indicator. In that case we return INVALID_OR_TAMPERED instead
-                of UNSIGNED so the suppressor correctly applies the 80-point risk penalty.
+          Step 2: If no embedded signature exists, check Windows Security Catalogs (SHA-256 + SHA-1).
+          Step 3: Extract leaf publisher & issuer names from the certificate store.
         """
         if not self._available or not os.path.isfile(file_path):
             return SignatureResult(
@@ -312,22 +328,16 @@ class TrustVerifier:
                 is_microsoft_signed=is_ms,
             )
 
-        # 2. If embedded returns TRUST_E_NOSIGNATURE, check OS Security Catalogs
+        # 2. If embedded returns TRUST_E_NOSIGNATURE, check if a corrupt WIN_CERTIFICATE table was stapled
         if emb_status == TRUST_E_NOSIGNATURE:
-            # Special case: WIN_CERTIFICATE table is present but WinVerifyTrust cannot
-            # parse it — the cert blob is malformed / byte-patched. Treat as tampered.
             if has_embedded_cert_table:
-                signer, issuer = self._extract_cert_names(abs_path)
                 return SignatureResult(
                     is_trusted=False,
                     signature_type="INVALID_OR_TAMPERED",
                     status_code=emb_status,
-                    status_label=(
-                        "WIN_CERTIFICATE table present but unparseable by WinVerifyTrust "
-                        "(malformed / byte-patched Authenticode blob)"
-                    ),
-                    signer_subject=signer,
-                    issuer_subject=issuer,
+                    status_label="Malformed or tampered WIN_CERTIFICATE table rejected by WinVerifyTrust",
+                    signer_subject="",
+                    issuer_subject="",
                     catalog_path="",
                     is_microsoft_signed=False,
                 )
@@ -338,7 +348,7 @@ class TrustVerifier:
                 if not signer:
                     signer = "Microsoft Windows (OS Security Catalog)"
                 is_ms = self._check_microsoft_name(signer, issuer) or (
-                    "system32\\catroot" in cat_path.lower()
+                    "\\catroot\\" in cat_path.lower()
                 )
                 return SignatureResult(
                     is_trusted=True,
@@ -397,7 +407,6 @@ class TrustVerifier:
             None, ctypes.byref(action_guid), ctypes.byref(wtd)
         )
 
-        # Always release state handle
         wtd.dwStateAction = WTD_STATEACTION_CLOSE
         self._wintrust.WinVerifyTrust(
             None, ctypes.byref(action_guid), ctypes.byref(wtd)
@@ -405,75 +414,108 @@ class TrustVerifier:
 
         return status & 0xFFFFFFFF
 
-    def _verify_catalog(self, file_path: str) -> tuple[bool, str]:
+    def _verify_catalog(self, file_path: str) -> Tuple[bool, str]:
         """
         Looks up the file's Authenticode digest in the Windows CatRoot database.
-        Returns (is_trusted, catalog_file_path).
+        Checks both SHA-256 (CryptCATAdminAcquireContext2) and SHA-1 catalogs.
         """
-        h_cat_admin = ctypes.c_void_p()
-        if not self._wintrust.CryptCATAdminAcquireContext(
-            ctypes.byref(h_cat_admin), None, 0
-        ):
+        h_file = self._kernel32.CreateFileW(
+            file_path,
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            None,
+            OPEN_EXISTING,
+            0,
+            None,
+        )
+        if h_file == INVALID_HANDLE_VALUE or not h_file:
             return False, ""
 
         try:
-            h_file = self._kernel32.CreateFileW(
-                file_path,
-                GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                None,
-                OPEN_EXISTING,
-                0,
-                None,
-            )
-            if h_file == INVALID_HANDLE_VALUE or not h_file:
-                return False, ""
+            # Try modern SHA-256 catalog context first, then legacy SHA-1
+            for alg in ("SHA256", None):
+                if alg == "SHA256" and not self._has_cat_v2:
+                    continue
+                trusted, cat_path = self._query_catalog_context(h_file, alg)
+                if trusted:
+                    return True, cat_path
+            return False, ""
+        finally:
+            self._kernel32.CloseHandle(h_file)
 
-            try:
-                hash_len = wintypes.DWORD(0)
+    def _query_catalog_context(
+        self, h_file: wintypes.HANDLE, algorithm: Optional[str]
+    ) -> Tuple[bool, str]:
+        h_cat_admin = ctypes.c_void_p()
+        if algorithm is not None:
+            ok = self._wintrust.CryptCATAdminAcquireContext2(
+                ctypes.byref(h_cat_admin), None, algorithm, None, 0
+            )
+        else:
+            ok = self._wintrust.CryptCATAdminAcquireContext(
+                ctypes.byref(h_cat_admin), None, 0
+            )
+        if not ok or not h_cat_admin:
+            return False, ""
+
+        try:
+            hash_len = wintypes.DWORD(0)
+            if algorithm is not None:
+                self._wintrust.CryptCATAdminCalcHashFromFileHandle2(
+                    h_cat_admin, h_file, ctypes.byref(hash_len), None, 0
+                )
+            else:
                 self._wintrust.CryptCATAdminCalcHashFromFileHandle(
                     h_file, ctypes.byref(hash_len), None, 0
                 )
-                if hash_len.value == 0:
-                    return False, ""
+            if hash_len.value == 0:
+                return False, ""
 
-                hash_buf = (ctypes.c_ubyte * hash_len.value)()
-                if not self._wintrust.CryptCATAdminCalcHashFromFileHandle(
+            hash_buf = (ctypes.c_ubyte * hash_len.value)()
+            if algorithm is not None:
+                calc_ok = self._wintrust.CryptCATAdminCalcHashFromFileHandle2(
+                    h_cat_admin, h_file, ctypes.byref(hash_len), hash_buf, 0
+                )
+            else:
+                calc_ok = self._wintrust.CryptCATAdminCalcHashFromFileHandle(
                     h_file, ctypes.byref(hash_len), hash_buf, 0
-                ):
-                    return False, ""
+                )
+            if not calc_ok:
+                return False, ""
 
+            prev_cat = ctypes.c_void_p(None)
+            while True:
                 h_cat_info = self._wintrust.CryptCATAdminEnumCatalogFromHash(
-                    h_cat_admin, hash_buf, hash_len.value, 0, None
+                    h_cat_admin,
+                    hash_buf,
+                    hash_len.value,
+                    0,
+                    ctypes.byref(prev_cat) if prev_cat.value else None,
                 )
                 if not h_cat_info:
-                    return False, ""
+                    break
 
-                try:
-                    cat_info = CATALOG_INFO()
-                    cat_info.cbStruct = ctypes.sizeof(CATALOG_INFO)
-                    if not self._wintrust.CryptCATCatalogInfoFromContext(
-                        h_cat_info, ctypes.byref(cat_info), 0
-                    ):
-                        return False, ""
-
+                prev_cat = ctypes.c_void_p(h_cat_info)
+                cat_info = CATALOG_INFO()
+                cat_info.cbStruct = ctypes.sizeof(CATALOG_INFO)
+                if self._wintrust.CryptCATCatalogInfoFromContext(
+                    h_cat_info, ctypes.byref(cat_info), 0
+                ):
                     cat_file_path = cat_info.wszCatalogFile
-                    # Verify that the catalog file itself is cryptographically valid
-                    cat_status = self._verify_embedded(cat_file_path)
-                    if cat_status == 0:
+                    if self._verify_embedded(cat_file_path) == 0:
+                        self._wintrust.CryptCATAdminReleaseCatalogContext(
+                            h_cat_admin, h_cat_info, 0
+                        )
                         return True, cat_file_path
-                    return False, cat_file_path
-                finally:
-                    self._wintrust.CryptCATAdminReleaseCatalogContext(
-                        h_cat_admin, h_cat_info, 0
-                    )
-            finally:
-                self._kernel32.CloseHandle(h_file)
+            return False, ""
         finally:
             self._wintrust.CryptCATAdminReleaseContext(h_cat_admin, 0)
 
-    def _extract_cert_names(self, signed_file_path: str) -> tuple[str, str]:
-        """Extracts Signer Simple Display Name and Issuer Name from a signed file or .cat."""
+    def _extract_cert_names(self, signed_file_path: str) -> Tuple[str, str]:
+        """
+        Enumerates all certificates in the PKCS#7 store and selects the leaf
+        code-signing certificate (excluding intermediate/root CA issuers).
+        """
         encoding = wintypes.DWORD(0)
         content_type = wintypes.DWORD(0)
         format_type = wintypes.DWORD(0)
@@ -497,42 +539,55 @@ class TrustVerifier:
         if not ok or not h_store:
             return "", ""
 
-        signer_name = ""
-        issuer_name = ""
+        pairs: List[Tuple[str, str]] = []
         try:
-            p_cert = self._crypt32.CertEnumCertificatesInStore(h_store, None)
-            if p_cert:
-                try:
-                    name_buf = ctypes.create_unicode_buffer(256)
-                    if self._crypt32.CertGetNameStringW(
-                        p_cert,
-                        CERT_NAME_SIMPLE_DISPLAY_TYPE,
-                        0,
-                        None,
-                        name_buf,
-                        256,
-                    ) > 1:
-                        signer_name = name_buf.value
+            p_cert = None
+            while True:
+                p_cert = self._crypt32.CertEnumCertificatesInStore(h_store, p_cert)
+                if not p_cert:
+                    break
+                subj = ""
+                iss = ""
+                name_buf = ctypes.create_unicode_buffer(256)
+                if (
+                    self._crypt32.CertGetNameStringW(
+                        p_cert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, None, name_buf, 256
+                    )
+                    > 1
+                ):
+                    subj = name_buf.value
 
-                    issuer_buf = ctypes.create_unicode_buffer(256)
-                    if self._crypt32.CertGetNameStringW(
+                issuer_buf = ctypes.create_unicode_buffer(256)
+                if (
+                    self._crypt32.CertGetNameStringW(
                         p_cert,
                         CERT_NAME_SIMPLE_DISPLAY_TYPE,
                         CERT_NAME_ISSUER_FLAG,
                         None,
                         issuer_buf,
                         256,
-                    ) > 1:
-                        issuer_name = issuer_buf.value
-                finally:
-                    self._crypt32.CertFreeCertificateContext(p_cert)
+                    )
+                    > 1
+                ):
+                    iss = issuer_buf.value
+                if subj:
+                    pairs.append((subj, iss))
         finally:
             if h_store:
                 self._crypt32.CertCloseStore(h_store, 0)
             if h_msg:
                 self._crypt32.CryptMsgClose(h_msg)
 
-        return signer_name, issuer_name
+        if not pairs:
+            return "", ""
+
+        # Leaf certificate is the subject that is NOT an issuer for another cert in the store
+        all_issuers = {iss for _, iss in pairs if iss}
+        for subj, iss in pairs:
+            if subj not in all_issuers and subj != iss:
+                return subj, iss
+
+        return pairs[0]
 
     @staticmethod
     def _check_microsoft_name(signer: str, issuer: str) -> bool:

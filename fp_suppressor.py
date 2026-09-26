@@ -128,8 +128,8 @@ class FalsePositiveSuppressor:
                         category="FP_SUPPRESSED",
                     )
                 )
-        elif sig.signature_type == "INVALID_OR_TAMPERED":
-            naive_score += 80
+        elif sig.signature_type == "INVALID_OR_TAMPERED" or pe.has_embedded_cert_table:
+            naive_score += 85
             independent_layers_triggered.add("L1_CRYPTO_TAMPER")
             desc = (
                 f"Cryptographic signature validation failed: {sig.status_label}"
@@ -140,7 +140,7 @@ class FalsePositiveSuppressor:
                 EvidenceItem(
                     layer="L1_CRYPTO_TAMPER",
                     description=desc,
-                    weight=80,
+                    weight=85,
                     category="RISK_VECTOR",
                 )
             )
@@ -162,17 +162,18 @@ class FalsePositiveSuppressor:
         # -------------------------------------------------------------------
         if pe.rich_header.present:
             if pe.rich_header.checksum_valid:
-                anchors.append(
-                    EvidenceItem(
-                        layer="L2_RICH_PROVENANCE",
-                        description=(
-                            f"Authentic MSVC Rich Header ('DanS') verified via ROL32 checksum "
-                            f"(0x{pe.rich_header.xor_key:08X}, {pe.rich_header.entry_count} toolchain build objects)"
-                        ),
-                        weight=-15,
-                        category="TRUST_ANCHOR",
+                if "L1_CRYPTO_TAMPER" not in independent_layers_triggered:
+                    anchors.append(
+                        EvidenceItem(
+                            layer="L2_RICH_PROVENANCE",
+                            description=(
+                                f"Authentic MSVC Rich Header ('DanS') verified via ROL32 checksum "
+                                f"(0x{pe.rich_header.xor_key:08X}, {pe.rich_header.entry_count} toolchain build objects)"
+                            ),
+                            weight=-15,
+                            category="TRUST_ANCHOR",
+                        )
                     )
-                )
             else:
                 naive_score += 35
                 independent_layers_triggered.add("L2_RICH_FORGERY")
@@ -493,19 +494,28 @@ class FalsePositiveSuppressor:
         """
         Detects canonical Windows binary masquerading, typosquatting (Levenshtein distance 1),
         and internal VS_VERSIONINFO OriginalFilename spoofing.
+        Uses strict SystemRoot prefix anchoring to prevent C:\\Temp\\windows\\system32\\ bypasses.
         """
         fname_low = pe.file_name.lower()
-        full_low = pe.file_path.lower()
+        norm_full = os.path.normcase(os.path.normpath(os.path.abspath(pe.file_path)))
+        sys_root = os.path.normcase(
+            os.path.normpath(os.environ.get("SystemRoot", r"C:\Windows"))
+        )
+        drive_root = os.path.splitdrive(sys_root)[0] or "c:"
 
         # 1. Exact filename match against protected Windows processes
         for sys_bin, valid_dirs in self.PROTECTED_SYSTEM_BINARIES.items():
             if fname_low == sys_bin.lower():
-                in_valid_dir = any(vd in full_low for vd in valid_dirs)
+                anchored_prefixes = [
+                    os.path.normcase(os.path.normpath(drive_root + vd)) + os.sep
+                    for vd in valid_dirs
+                ]
+                in_valid_dir = any(norm_full.startswith(pref) for pref in anchored_prefixes)
                 if not in_valid_dir and not sig.is_microsoft_signed:
                     return (
                         True,
                         f"Critical OS binary masquerade: '{pe.file_name}' executing outside canonical "
-                        f"Windows directory ({pe.file_path}) and lacks Microsoft signature",
+                        f"SystemRoot directory ({pe.file_path}) and lacks Microsoft signature",
                         85,
                     )
                 if not sig.is_trusted:

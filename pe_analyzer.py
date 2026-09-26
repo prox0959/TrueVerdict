@@ -109,7 +109,7 @@ class PEAnalysisReport:
     entry_point_section: str = ""
     is_dll: bool = False
     is_dotnet: bool = False
-    has_Save_cet_or_cfg: bool = False
+    has_cfg_enabled: bool = False
     has_tls_callbacks: bool = False
     has_embedded_cert_table: bool = False
     embedded_cert_size: int = 0
@@ -320,6 +320,11 @@ class PEAnalyzer:
 
         opt_magic = struct.unpack_from("<H", data, opt_off)[0]
         is_64 = opt_magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC
+        min_opt = 112 if is_64 else 96
+        if opt_hdr_size < min_opt or opt_off + min_opt > fsize:
+            report.error_message = "Truncated Optional Header for target architecture"
+            return report
+
         major_linker, minor_linker = struct.unpack_from("<BB", data, opt_off + 2)
         report.linker_version = f"{major_linker}.{minor_linker}"
         report.entry_point_rva = struct.unpack_from("<I", data, opt_off + 16)[0]
@@ -335,7 +340,7 @@ class PEAnalyzer:
 
         report.subsystem = subsystem
         # Check Control Flow Guard (IMAGE_DLLCHARACTERISTICS_GUARD_CF = 0x4000)
-        report.has_Save_cet_or_cfg = bool(dll_chars & 0x4000)
+        report.has_cfg_enabled = bool(dll_chars & 0x4000)
 
         data_dirs: List[Tuple[int, int]] = []
         max_dirs = min(num_rva_and_sizes, 16)
@@ -552,17 +557,18 @@ class PEAnalyzer:
             entry_off = dbg_off + i * 28
             if entry_off + 28 > len(data):
                 break
-            _, _, _, _, dbg_type, size_of_data, _, ptr_raw_data = struct.unpack_from(
+            _, _, _, _, dbg_type, size_of_data, addr_raw_data, ptr_raw_data = struct.unpack_from(
                 "<IIHHIIII", data, entry_off
             )
             if dbg_type == IMAGE_DEBUG_TYPE_REPRO:
                 report.is_reproducible_build = True
-            elif dbg_type == IMAGE_DEBUG_TYPE_CODEVIEW and ptr_raw_data > 0:
-                if ptr_raw_data + 24 < len(data) and data[ptr_raw_data : ptr_raw_data + 4] == b"RSDS":
-                    end_idx = data.find(b"\x00", ptr_raw_data + 24, min(len(data), ptr_raw_data + 512))
+            elif dbg_type == IMAGE_DEBUG_TYPE_CODEVIEW:
+                cv_off = ptr_raw_data if ptr_raw_data > 0 else (self._rva_to_offset(addr_raw_data, report.sections) or 0)
+                if cv_off > 0 and cv_off + 24 < len(data) and data[cv_off : cv_off + 4] == b"RSDS":
+                    end_idx = data.find(b"\x00", cv_off + 24, min(len(data), cv_off + 512))
                     if end_idx != -1:
                         report.has_debug_pdb = True
-                        report.pdb_path = data[ptr_raw_data + 24 : end_idx].decode(
+                        report.pdb_path = data[cv_off + 24 : end_idx].decode(
                             "utf-8", errors="replace"
                         )
 
@@ -619,6 +625,8 @@ class PEAnalyzer:
 
             thunk_rva = orig_first_thunk if orig_first_thunk != 0 else first_thunk
             thunk_off = self._rva_to_offset(thunk_rva, report.sections)
+            if thunk_off is None and first_thunk != 0:
+                thunk_off = self._rva_to_offset(first_thunk, report.sections)
             if thunk_off is None:
                 continue
 
