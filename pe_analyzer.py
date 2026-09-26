@@ -113,6 +113,7 @@ class PEAnalysisReport:
     has_tls_callbacks: bool = False
     has_embedded_cert_table: bool = False
     embedded_cert_size: int = 0
+    hardlink_count: int = 1
     has_overlay: bool = False
     overlay_size: int = 0
     overlay_entropy: float = 0.0
@@ -277,6 +278,11 @@ class PEAnalyzer:
                 error_message="Invalid PE\\0\\0 signature",
             )
 
+        try:
+            nlink = os.stat(abs_path).st_nlink
+        except OSError:
+            nlink = 1
+
         report = PEAnalysisReport(
             file_path=abs_path,
             file_name=fname,
@@ -285,6 +291,7 @@ class PEAnalyzer:
             sha256=hashlib.sha256(data).hexdigest(),
             md5=hashlib.md5(data).hexdigest(),
             overall_entropy=compute_shannon_entropy(data),
+            hardlink_count=nlink,
         )
 
         # 1. Parse Rich Header & Verify ROL32 Checksum

@@ -503,6 +503,13 @@ class FalsePositiveSuppressor:
         )
         drive_root = os.path.splitdrive(sys_root)[0] or "c:"
 
+        winsxs_servicing_intact = (
+            pe.hardlink_count >= 2
+            and pe.is_reproducible_build
+            and pe.rich_header.checksum_valid
+            and not pe.has_rwx_section
+        )
+
         # 1. Exact filename match against protected Windows processes
         for sys_bin, valid_dirs in self.PROTECTED_SYSTEM_BINARIES.items():
             if fname_low == sys_bin.lower():
@@ -518,7 +525,7 @@ class FalsePositiveSuppressor:
                         f"SystemRoot directory ({pe.file_path}) and lacks Microsoft signature",
                         85,
                     )
-                if not sig.is_trusted:
+                if not sig.is_trusted and not (in_valid_dir and winsxs_servicing_intact):
                     return (
                         True,
                         f"Unsigned binary masquerading as protected Windows process '{pe.file_name}'",
@@ -538,7 +545,7 @@ class FalsePositiveSuppressor:
 
         # 3. VS_VERSIONINFO claims Microsoft Corporation on an unsigned binary
         company = pe.version_info.get("CompanyName", "")
-        if "microsoft" in company.lower() and not sig.is_trusted:
+        if "microsoft" in company.lower() and not sig.is_trusted and not winsxs_servicing_intact:
             return (
                 True,
                 f"Spoofed VS_VERSIONINFO metadata: claims CompanyName='{company}' but lacks valid Microsoft signature",
